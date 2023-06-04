@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/grafana/synthetic-monitoring-agent/pkg/pb/synthetic_monitoring"
 	smapi "github.com/grafana/synthetic-monitoring-api-go-client"
@@ -21,6 +24,8 @@ type cfg struct {
 	metricsInstanceID int64
 	publisherToken    string
 	removeAllChecks   bool
+	job               string
+	probeIDs          []int64
 }
 
 func (c cfg) Validate() error {
@@ -28,6 +33,23 @@ func (c cfg) Validate() error {
 		return fmt.Errorf("invalid API server URL: %q", c.apiServerURL)
 	}
 
+	return nil
+}
+
+type sliceFlag []int64
+
+func (i *sliceFlag) String() string {
+	return fmt.Sprintf("%v", *i)
+}
+
+func (i *sliceFlag) Set(value string) error {
+	for _, probeID := range strings.Split(value, ",") {
+		id, err := strconv.ParseInt(probeID, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid probe ID: %s", probeID)
+		}
+		*i = append(*i, id)
+	}
 	return nil
 }
 
@@ -45,6 +67,8 @@ func main() {
 	fs.Int64Var(&cfg.metricsInstanceID, "metrics-instance-id", 0, "grafana.com hosted metrics instance ID")
 	fs.StringVar(&cfg.publisherToken, "publisher-token", "", "grafana.com publisher token")
 	fs.BoolVar(&cfg.removeAllChecks, "remove-checks", false, "remove existing checks")
+	fs.StringVar(&cfg.job, "job", "https", "job to use for checks")
+	fs.Var((*sliceFlag)(&cfg.probeIDs), "probe-ids", "probe IDs to use for checks")
 
 	switch err := fs.Parse(os.Args[1:]); {
 	case errors.Is(err, flag.ErrHelp):
@@ -67,7 +91,6 @@ func main() {
 		Int64("grafana-instance-id", cfg.grafanaInstanceID).
 		Int64("metrics-instance-id", cfg.metricsInstanceID).
 		Int64("logs-instance-id", cfg.logsInstanceID).
-		Str("publisher-token", cfg.publisherToken).
 		Str("api-server-url", cfg.apiServerURL).
 		Logger()
 
@@ -89,7 +112,7 @@ func main() {
 		}
 	}
 
-	if err := addChecks(ctx, c, logger); err != nil {
+	if err := addChecks(ctx, c, logger, cfg); err != nil {
 		logger.Error().Err(err).Msg("adding checks")
 		return
 	}
@@ -148,19 +171,15 @@ func removeAllChecks(ctx context.Context, client *smapi.Client, logger zerolog.L
 	return nil
 }
 
-func addChecks(ctx context.Context, client *smapi.Client, logger zerolog.Logger) error {
-	probes, err := client.ListProbes(ctx)
+func addChecks(ctx context.Context, client *smapi.Client, logger zerolog.Logger, cfg cfg) error {
+
+	targets, err := readTargets("targets.txt")
 	if err != nil {
-		logger.Error().Err(err).Msg("listing probes")
+		logger.Error().Err(err).Msg("reading targets")
 		return err
 	}
 
-	probeIDs := make([]int64, len(probes))
-	for i, p := range probes {
-		probeIDs[i] = p.Id
-	}
-
-	for _, check := range getTestChecks(1, probeIDs) {
+	for _, check := range getTestChecks(cfg.job, cfg.probeIDs, targets) {
 		c, err := client.AddCheck(ctx, check)
 		if err != nil {
 			logger.Error().Err(err).Msg("adding check")
@@ -175,159 +194,62 @@ func addChecks(ctx context.Context, client *smapi.Client, logger zerolog.Logger)
 	return nil
 }
 
-func getTestChecks(groupID int, probeIDs []int64) []synthetic_monitoring.Check {
+func getTestChecks(job string, probeIDs []int64, targets []string) []synthetic_monitoring.Check {
 	checkConfigs := []struct {
-		target           string
-		job              string
 		basicMetricsOnly bool
 		settings         synthetic_monitoring.CheckSettings
 	}{
 		{
-			target:           "127.0.0.1",
-			job:              "ping-ipv4-basic",
-			basicMetricsOnly: true,
-			settings: synthetic_monitoring.CheckSettings{
-				Ping: &synthetic_monitoring.PingSettings{
-					IpVersion: synthetic_monitoring.IpVersion_V4,
-				},
-			},
-		},
-		{
-			target:           "::1",
-			job:              "ping-ipv6-basic",
-			basicMetricsOnly: true,
-			settings: synthetic_monitoring.CheckSettings{
-				Ping: &synthetic_monitoring.PingSettings{
-					IpVersion: synthetic_monitoring.IpVersion_V6,
-				},
-			},
-		},
-		{
-			target:           "127.0.0.1",
-			job:              "ping-ipv4",
-			basicMetricsOnly: false,
-			settings: synthetic_monitoring.CheckSettings{
-				Ping: &synthetic_monitoring.PingSettings{
-					IpVersion: synthetic_monitoring.IpVersion_V4,
-				},
-			},
-		},
-		{
-			target:           "::1",
-			job:              "ping-ipv6",
-			basicMetricsOnly: false,
-			settings: synthetic_monitoring.CheckSettings{
-				Ping: &synthetic_monitoring.PingSettings{
-					IpVersion: synthetic_monitoring.IpVersion_V6,
-				},
-			},
-		},
-
-		// http
-		{
-			target:           "http://google.com/",
-			job:              "http-ipv4-basic",
 			basicMetricsOnly: true,
 			settings: synthetic_monitoring.CheckSettings{
 				Http: &synthetic_monitoring.HttpSettings{
-					IpVersion: synthetic_monitoring.IpVersion_V4,
-				},
-			},
-		},
-		{
-			target:           "https://google.com/",
-			job:              "https-ipv4-basic",
-			basicMetricsOnly: true,
-			settings: synthetic_monitoring.CheckSettings{
-				Http: &synthetic_monitoring.HttpSettings{
-					IpVersion: synthetic_monitoring.IpVersion_V4,
-				},
-			},
-		},
-		{
-			target:           "http://google.com/",
-			job:              "http-ipv4",
-			basicMetricsOnly: false,
-			settings: synthetic_monitoring.CheckSettings{
-				Http: &synthetic_monitoring.HttpSettings{
-					IpVersion: synthetic_monitoring.IpVersion_V4,
-				},
-			},
-		},
-		{
-			target:           "https://google.com/",
-			job:              "https-ipv4",
-			basicMetricsOnly: false,
-			settings: synthetic_monitoring.CheckSettings{
-				Http: &synthetic_monitoring.HttpSettings{
-					IpVersion: synthetic_monitoring.IpVersion_V4,
-				},
-			},
-		},
-
-		// dns
-		{
-			target:           "google.com",
-			job:              "dns-ipv4-basic",
-			basicMetricsOnly: true,
-			settings: synthetic_monitoring.CheckSettings{
-				Dns: &synthetic_monitoring.DnsSettings{
-					IpVersion:  synthetic_monitoring.IpVersion_V4,
-					Server:     "dns.google",
-					RecordType: synthetic_monitoring.DnsRecordType_A,
-				},
-			},
-		},
-		{
-			target:           "google.com",
-			job:              "dns-ipv4",
-			basicMetricsOnly: false,
-			settings: synthetic_monitoring.CheckSettings{
-				Dns: &synthetic_monitoring.DnsSettings{
-					IpVersion:  synthetic_monitoring.IpVersion_V4,
-					Server:     "dns.google",
-					RecordType: synthetic_monitoring.DnsRecordType_A,
-				},
-			},
-		},
-
-		// tcp
-		{
-			target:           "127.0.0.1:22",
-			job:              "tcp-ipv4-basic",
-			basicMetricsOnly: true,
-			settings: synthetic_monitoring.CheckSettings{
-				Tcp: &synthetic_monitoring.TcpSettings{
-					IpVersion: synthetic_monitoring.IpVersion_V4,
-				},
-			},
-		},
-		{
-			target:           "127.0.0.1:22",
-			job:              "tcp-ipv4",
-			basicMetricsOnly: false,
-			settings: synthetic_monitoring.CheckSettings{
-				Tcp: &synthetic_monitoring.TcpSettings{
 					IpVersion: synthetic_monitoring.IpVersion_V4,
 				},
 			},
 		},
 	}
 
-	checks := make([]synthetic_monitoring.Check, 0, len(checkConfigs))
+	checks := make([]synthetic_monitoring.Check, 0, len(checkConfigs)*len(targets))
 
 	for _, cfg := range checkConfigs {
-		checks = append(checks, synthetic_monitoring.Check{
-			Target:           cfg.target,
-			Job:              fmt.Sprintf("%s-%d", cfg.job, groupID),
-			Frequency:        10000,
-			Timeout:          2000,
-			Enabled:          true,
-			Probes:           probeIDs,
-			Settings:         cfg.settings,
-			BasicMetricsOnly: cfg.basicMetricsOnly,
-		})
+		for _, target := range targets {
+			checks = append(checks, synthetic_monitoring.Check{
+				Target:           target,
+				Job:              fmt.Sprintf("%s", job),
+				Frequency:        60000,
+				Timeout:          2000,
+				Enabled:          true,
+				AlertSensitivity: "low",
+				Probes:           probeIDs,
+				Settings:         cfg.settings,
+				BasicMetricsOnly: cfg.basicMetricsOnly,
+			})
+		}
 	}
 
 	return checks
+}
+
+func readTargets(filename string) ([]string, error) {
+	var targets []string
+
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		target := strings.TrimSpace(scanner.Text())
+		if target != "" {
+			targets = append(targets, target)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return targets, nil
 }
